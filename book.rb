@@ -6,16 +6,15 @@ require 'uri'
 require 'date'
 require 'base64'
 
-# --- 設定・定数 ---
+# --- Constants ---
 ISBN_PATTERN = /(97[89]\d{10}|\d{10})/
 VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
 BOOKS_API_URL  = "https://www.googleapis.com/books/v1/volumes"
 
-# --- 外部サービス連携ロジック ---
+# --- Module definition ---
 module BookBot
   module_function
 
-  # Google Vision APIで画像からISBNを抽出
   def extract_isbn(image_binary)
     payload = {
       requests: [{
@@ -29,7 +28,6 @@ module BookBot
     text.gsub(/[-－\s]/, '').match(ISBN_PATTERN)&.[](1)
   end
 
-  # OpenBDから出版社名を取得する（ISBNが必要）
   def fetch_publisher_from_openbd(isbn)
     return nil if isbn.nil?
   
@@ -37,26 +35,24 @@ module BookBot
     begin
       response = Net::HTTP.get(uri)
       data = JSON.parse(response)
-      # OpenBDは配列で返ってくる。データがあれば出版社名を返す
       data.dig(0, "summary", "publisher")
     rescue
-      nil # エラー時はおとなしくnilを返す
+      nil
     end
   end
 
-  # Google Books APIから情報を取得
   def fetch_info(input_text)
     clean_input = input_text.gsub(/[-－\s]/, '')
     is_isbn = clean_input.match?(/\A#{ISBN_PATTERN}\z/)
 
-    # 1. まずはISBN（またはタイトル）で検索
+    # 1. Search by ISBN or Title
     query = is_isbn ? "isbn:#{clean_input}" : "intitle:#{URI.encode_www_form_component(input_text.strip)}"
     res = get_request("#{BOOKS_API_URL}?q=#{query}&maxResults=1&key=#{ENV['BOOKS_API_KEY']}")
     item = res.dig("items", 0, "volumeInfo")
 
     return nil unless item
 
-    # --- 【ステップ2】Google Books内での再検索ロジック ---
+    # 2. Retry within Google Books API
     if item["publisher"].nil? || item["publisher"].empty?
       retry_query = "intitle:#{URI.encode_www_form_component(item['title'])}"
       retry_query += "+inauthor:#{URI.encode_www_form_component(item['authors'][0])}" if item["authors"]&.any?
@@ -70,20 +66,17 @@ module BookBot
       end
     end
 
-    # --- 【追加ステップ3】それでもダメならOpenBDで補完 ---
+    # 3. Retry by OpenBD
     if item["publisher"].nil? || item["publisher"].empty?
-      # OpenBDを叩くためにISBNを特定する
-      # 入力がISBNならそれを使い、そうでなければGoogle Booksの結果からISBNを抜き出す
+      # Identify ISBN to use OpenBD
       target_isbn = if is_isbn
                       clean_input
                     else
-                      # industryIdentifiersの中からISBN_13を優先して探す
                       item["industryIdentifiers"]&.find { |id| id["type"] == "ISBN_13" }&.[]("identifier") ||
                       item["industryIdentifiers"]&.find { |id| id["type"] == "ISBN_10" }&.[]("identifier")
                     end
 
       if target_isbn
-        # 実装済みとされている関数を呼び出し
         openbd_publisher = fetch_publisher_from_openbd(target_isbn)
         if openbd_publisher && !openbd_publisher.empty?
           item["publisher"] = openbd_publisher
@@ -100,7 +93,6 @@ module BookBot
     }
   end
  
-  # 共通リクエスト処理
   def post_request(url, body)
     uri = URI.parse(url)
     res = Net::HTTP.post(uri, body, { 'Content-Type' => 'application/json' })
@@ -111,10 +103,8 @@ module BookBot
     JSON.parse(Net::HTTP.get(URI.parse(url)))
   end
 
-  # 日付整形
   def format_date(date_str)
     return "不明" if date_str.nil? || date_str.empty?
-    # Ruby 3.4の柔軟な日付解析を活用
     Date.parse(date_str).strftime("%Y/%m/%d") rescue date_str.gsub('-', '/')
   end
 
