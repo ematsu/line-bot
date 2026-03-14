@@ -10,6 +10,7 @@ require 'base64'
 ISBN_PATTERN = /(97[89]\d{10}|\d{10})/
 VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
 BOOKS_API_URL  = "https://www.googleapis.com/books/v1/volumes"
+RAKUTEN_API_URL = "https://openapi.rakuten.co.jp/services/api/BooksTotal/Search/20170404"
 
 # --- Module definition ---
 module BookBot
@@ -23,9 +24,27 @@ module BookBot
       }]
     }.to_json
 
-    res = post_request("#{VISION_API_URL}?key=#{ENV['BOOKS_API_KEY']}", payload)
+    res = post_request("#{VISION_API_URL}?key=#{ENV['GOOGLE_API_KEY']}", payload)
     text = res.dig("responses", 0, "fullTextAnnotation", "text") || ""
     text.gsub(/[-－\s]/, '').match(ISBN_PATTERN)&.[](1)
+  end
+
+  def fetch_from_openbd(isbn)
+    return nil if isbn.nil?
+    uri = URI.parse("https://api.openbd.jp/v1/get?isbn=#{isbn}")
+    response = Net::HTTP.get(uri)
+    data = JSON.parse(response).first # OpenBD returns array
+
+    return nil if data.nil?
+
+    # Get info. from summary level
+    {
+      publisher: data.dig("summary", "publisher"),
+      pub_date:  data.dig("summary", "pubdate") # "YYYYMMDD" format
+    }
+  rescue => e
+    puts "OpenBD Error: #{e.message}"
+    nil
   end
 
   def fetch_publisher_from_openbd(isbn)
@@ -47,43 +66,43 @@ module BookBot
 
     # 1. Search by ISBN or Title
     query = is_isbn ? "isbn:#{clean_input}" : "intitle:#{URI.encode_www_form_component(input_text.strip)}"
-    res = get_request("#{BOOKS_API_URL}?q=#{query}&maxResults=1&key=#{ENV['BOOKS_API_KEY']}")
-    item = res.dig("items", 0, "volumeInfo")
+    res = get_request("#{BOOKS_API_URL}?q=#{query}&maxResults=1&key=#{ENV['GOOGLE_API_KEY']}")
+    item = res.dig("items", 0, "volumeInfo") || {}
 
-    return nil unless item
+    # Identify ISBN
+    target_isbn = is_isbn ? clean_input : extract_isbn_from_google(item)
 
-    # 2. Retry within Google Books API
-    if item["publisher"].nil? || item["publisher"].empty?
-      retry_query = "intitle:#{URI.encode_www_form_component(item['title'])}"
-      retry_query += "+inauthor:#{URI.encode_www_form_component(item['authors'][0])}" if item["authors"]&.any?
-
-      retry_res = get_request("#{BOOKS_API_URL}?q=#{retry_query}&maxResults=1&key=#{ENV['BOOKS_API_KEY']}")
-      retry_item = retry_res.dig("items", 0, "volumeInfo")
-
-      if retry_item && retry_item["publisher"]
-        item["publisher"] = retry_item["publisher"]
-        item["publishedDate"] ||= retry_item["publishedDate"]
+    # 2. Get publisher and salesdate from OpenBD
+    if target_isbn && item["publisher"].to_s.empty?
+      openbd_data = fetch_from_openbd(target_isbn)
+      if openbd_data
+        # Supplement if Google does NOT return data
+        item["publisher"] ||= openbd_data[:publisher]
+        item["publishedDate"] ||= openbd_data[:pub_date]
       end
     end
 
-    # 3. Retry by OpenBD
-    if item["publisher"].nil? || item["publisher"].empty?
-      # Identify ISBN to use OpenBD
-      target_isbn = if is_isbn
-                      clean_input
-                    else
-                      item["industryIdentifiers"]&.find { |id| id["type"] == "ISBN_13" }&.[]("identifier") ||
-                      item["industryIdentifiers"]&.find { |id| id["type"] == "ISBN_10" }&.[]("identifier")
-                    end
+    # Check whether need supplement or not
+    needs_supplement = item["publisher"].to_s.empty? ||
+                       item["publishedDate"].to_s.length < 10
 
-      if target_isbn
-        openbd_publisher = fetch_publisher_from_openbd(target_isbn)
-        if openbd_publisher && !openbd_publisher.empty?
-          item["publisher"] = openbd_publisher
+    # 3. Supplement by Rakuten API
+    if target_isbn && needs_supplement
+      rakuten_data = fetch_from_rakuten(target_isbn)
+      if rakuten_data
+        # Overwrite when Rakuten returns "effective" data
+        unless rakuten_data[:publisher].to_s.empty?
+          item["publisher"] = rakuten_data[:publisher]
         end
+
+        unless rakuten_data[:pub_date].to_s.empty?
+          item["publishedDate"] = rakuten_data[:pub_date]
+        end
+
+        item["title"] ||= rakuten_data[:title]
+        item["authors"] ||= [rakuten_data[:authors]]
       end
     end
-    # ------------------------------------------------------------
 
     {
       title:     item["title"] || "不明",
@@ -92,7 +111,30 @@ module BookBot
       publisher: item["publisher"] || "不明"
     }
   end
- 
+
+  def fetch_from_rakuten(isbn)
+    return nil if isbn.nil?
+    # Remove "-" from ISBN code
+    pure_isbn = isbn.gsub(/\D/, '')
+    uri = URI.parse("#{RAKUTEN_API_URL}?format=json&isbnjan=#{pure_isbn}&applicationId=#{ENV['RAKUTEN_APP_ID']}&accessKey=#{ENV['RAKUTEN_ACCESS_KEY']}")
+
+    begin
+      response = Net::HTTP.get(uri)
+      data = JSON.parse(response).dig("Items", 0, "Item")
+      return nil unless data
+
+      {
+        title:     data["title"],
+        authors:   data["author"],
+        pub_date:  data["salesDate"], # Like "2024年03月"
+        publisher: data["publisherName"]
+      }
+    rescue => e
+      puts "Rakuten API Error: #{e.message}"
+      nil
+    end
+  end
+
   def post_request(url, body)
     uri = URI.parse(url)
     res = Net::HTTP.post(uri, body, { 'Content-Type' => 'application/json' })
@@ -105,7 +147,32 @@ module BookBot
 
   def format_date(date_str)
     return "不明" if date_str.nil? || date_str.empty?
-    Date.parse(date_str).strftime("%Y/%m/%d") rescue date_str.gsub('-', '/')
+
+    # 1. Completely cleaning
+    clean_date = date_str.to_s
+                         .tr('－ー', '-')           # 全角ハイフン・長音を半角に
+                         .gsub(/[頃日]/, '')        # 「頃」「日」を消す
+                         .gsub(/[年月]/, '-')       # 「年」「月」をハイフンに
+                         .gsub(/-+$/, '')           # 末尾のハイフンを消す
+                         .strip
+
+    # 2. Adjust OpenBD format to include "-"
+    if clean_date.match?(/\A\d{8}\z/)
+      clean_date = clean_date.gsub(/(\d{4})(\d{2})(\d{2})/, '\1-\2-\3')
+    end
+
+    # 3. add "-01" if day info. is missing
+    if clean_date.match?(/\A\d{4}-\d{2}\z/)
+      clean_date += "-01"
+    end
+
+    begin
+      # Format to YYYY/MM/DD
+      Date.parse(clean_date).strftime("%Y/%m/%d")
+    rescue ArgumentError, TypeError
+      # If error, just return the original date_str
+      clean_date
+    end
   end
 
   def build_template(book)
