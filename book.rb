@@ -47,19 +47,6 @@ module BookBot
     nil
   end
 
-  def fetch_publisher_from_openbd(isbn)
-    return nil if isbn.nil?
-  
-    uri = URI.parse("https://api.openbd.jp/v1/get?isbn=#{isbn}")
-    begin
-      response = Net::HTTP.get(uri)
-      data = JSON.parse(response)
-      data.dig(0, "summary", "publisher")
-    rescue
-      nil
-    end
-  end
-
   def fetch_info(input_text)
     clean_input = input_text.gsub(/[-－\s]/, '')
     is_isbn = clean_input.match?(/\A#{ISBN_PATTERN}\z/)
