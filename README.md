@@ -1,6 +1,6 @@
 # Line bot for Book reading memo
 
-Yet another script for MyDNS.JP users to renew let's encrypt certificate with manual authenticator
+Personal Book memo generator to insert "Google Keep Memo". It generation formatted text to "copy & paste" by using Google Vision/Book API and other APIs (Rakuken & OpenBD).
 
 ## Installation
 Step1:

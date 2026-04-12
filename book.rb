@@ -29,6 +29,39 @@ module BookBot
     text.gsub(/[-－\s]/, '').match(ISBN_PATTERN)&.[](1)
   end
 
+  def extract_isbn_from_google(item)
+    identifiers = item["industryIdentifiers"]
+    return nil unless identifiers
+
+    # Amazonリンク用にISBN_10を優先的に探す
+    isbn10 = identifiers.find { |id| id["type"] == "ISBN_10" }&.[]("identifier")
+    isbn13 = identifiers.find { |id| id["type"] == "ISBN_13" }&.[]("identifier")
+
+    isbn10 || isbn13
+  end
+
+  # ISBN13をISBN10に変換する補助関数（Amazonリンク用）
+  def convert_to_isbn10(isbn13)
+    return isbn13 if isbn13.nil? || isbn13.length != 13
+
+    # 978... で始まるもののみ変換可能
+    return isbn13 unless isbn13.start_with?("978")
+
+    body = isbn13[3..11]
+    sum = 0
+    body.chars.each_with_index do |char, i|
+      sum += char.to_i * (10 - i)
+    end
+
+    remainder = 11 - (sum % 11)
+    check_digit = case remainder
+                  when 10 then 'X'
+                  when 11 then '0'
+                  else remainder.to_s
+                  end
+    body + check_digit
+  end
+
   def fetch_from_openbd(isbn)
     return nil if isbn.nil?
     uri = URI.parse("https://api.openbd.jp/v1/get?isbn=#{isbn}")
@@ -58,6 +91,7 @@ module BookBot
 
     # Identify ISBN
     target_isbn = is_isbn ? clean_input : extract_isbn_from_google(item)
+    isbn10 = (target_isbn && target_isbn.length == 13) ? convert_to_isbn10(target_isbn) : target_isbn
 
     # 2. Get publisher and salesdate from OpenBD
     if target_isbn && item["publisher"].to_s.empty?
@@ -95,7 +129,8 @@ module BookBot
       title:     item["title"] || "不明",
       authors:   item["authors"]&.join(", ") || "不明",
       pub_date:  format_date(item["publishedDate"]),
-      publisher: item["publisher"] || "不明"
+      publisher: item["publisher"] || "不明",
+      isbn10:    isbn10 # Link to www.amazon.co.jp
     }
   end
 
@@ -113,7 +148,7 @@ module BookBot
       {
         title:     data["title"],
         authors:   data["author"],
-        pub_date:  data["salesDate"], # Like "2024年03月"
+        pub_date:  data["salesDate"],
         publisher: data["publisherName"]
       }
     rescue => e
@@ -163,6 +198,8 @@ module BookBot
   end
 
   def build_template(book)
+    amazon_link = book[:isbn10] ? "https://www.amazon.co.jp/dp/#{book[:isbn10]}" : "リンクなし"
+
     <<~TEXT.chomp
       ★基本情報
       ・タイトル：#{book[:title]}
@@ -170,6 +207,7 @@ module BookBot
       ・発行日：#{book[:pub_date]}
       ・出版社名：#{book[:publisher]}
       ・読んだ日付：#{Date.today.strftime("%Y/%m/%d")}
+      ・リンク：#{amazon_link}
       ★所感など
       ・手にとったきっかけ：
       ・引っかかった言葉：
