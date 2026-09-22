@@ -92,6 +92,7 @@ module BookBot
     # Identify ISBN
     target_isbn = is_isbn ? clean_input : extract_isbn_from_google(item)
     isbn10 = (target_isbn && target_isbn.length == 13) ? convert_to_isbn10(target_isbn) : target_isbn
+    isbn13 = (target_isbn && target_isbn.length == 13) ? target_isbn : nil
 
     # 2. Get publisher and salesdate from OpenBD
     if target_isbn && item["publisher"].to_s.empty?
@@ -130,7 +131,8 @@ module BookBot
       authors:   item["authors"]&.join(", ") || "不明",
       pub_date:  format_date(item["publishedDate"]),
       publisher: item["publisher"] || "不明",
-      isbn10:    isbn10 # Link to www.amazon.co.jp
+      isbn10:    isbn10, # Link to www.amazon.co.jp
+      isbn13:    isbn13  # Link to hanmoto.com
     }
   end
 
@@ -199,6 +201,7 @@ module BookBot
 
   def build_template(book)
     amazon_link = book[:isbn10] ? "https://www.amazon.co.jp/dp/#{book[:isbn10]}" : "リンクなし"
+    hanmoto_link = book[:isbn13] ? "https://hanmoto.com/bd/isbn/#{book[:isbn13]}" : "リンクなし"
 
     <<~TEXT.chomp
       ★基本情報
@@ -207,7 +210,7 @@ module BookBot
       ・発行日：#{book[:pub_date]}
       ・出版社名：#{book[:publisher]}
       ・読んだ日付：#{Date.today.strftime("%Y/%m/%d")}
-      ・リンク：#{amazon_link}
+      ・リンク：#{hanmoto_link}
       ★所感など
       ・手にとったきっかけ：
       ・引っかかった言葉：
